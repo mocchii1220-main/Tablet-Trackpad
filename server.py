@@ -1,9 +1,4 @@
-"""
-Tablet Trackpad - PC側サーバー（Windows専用）
-  pip install aiohttp
-  python server.py
-表示されたURLをタブレットのブラウザで開くだけで使えます。
-"""
+
 import ctypes
 import json
 import secrets
@@ -17,7 +12,7 @@ PORT = 8765
 BASE = Path(__file__).parent
 KEY_FILE = BASE / "key.txt"
 
-# 合言葉（初回だけ生成して保存。同じWi-Fiの他人に操作されないための鍵）
+# ---------- 認証キー ----------
 if KEY_FILE.exists():
     KEY = KEY_FILE.read_text().strip()
 else:
@@ -59,7 +54,7 @@ def send(flags, dx=0, dy=0, data=0):
 
 
 # ---------- モニター情報 ----------
-try:  # 物理ピクセルの座標で扱う（画面拡大設定の影響を受けないように）
+try:
     ctypes.windll.shcore.SetProcessDpiAwareness(2)
 except Exception:
     user32.SetProcessDPIAware()
@@ -99,7 +94,7 @@ def monitors_payload():
 
 
 def teleport(i):
-    """指定モニターの中央へカーソルを移動"""
+    # 指定モニターの中央へカーソルを移動
     mons = get_monitors()
     if 0 <= i < len(mons):
         m = mons[i]
@@ -139,7 +134,7 @@ async def ws_handler(request):
         return web.Response(status=403, text="Forbidden")
     ws = web.WebSocketResponse(compress=False)  # 小さなメッセージの圧縮は遅延の元
     await ws.prepare(request)
-    try:  # 小さいパケットをまとめて待たせない（Nagle無効化）
+    try: 
         sock = request.transport.get_extra_info("socket")
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
     except Exception:
@@ -182,6 +177,6 @@ def local_ip():
 if __name__ == "__main__":
     app = web.Application()
     app.add_routes([web.get("/", index), web.get("/ws", ws_handler)])
-    print("\nタブレットのブラウザで次のURLを開いてください:\n")
+    print("\nタブレットで次のURLを開いてください:\n")
     print(f"  http://{local_ip()}:{PORT}/?key={KEY}\n")
     web.run_app(app, host="0.0.0.0", port=PORT, print=None)
