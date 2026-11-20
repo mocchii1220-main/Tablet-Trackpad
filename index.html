@@ -1,0 +1,322 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no, viewport-fit=cover">
+<title>Tablet Trackpad</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #14161a; color: #9aa0a8;
+    font-family: system-ui, sans-serif; overscroll-behavior: none; }
+  #pad { position: fixed; inset: 0; touch-action: none; user-select: none; -webkit-user-select: none; }
+  #hud { position: fixed; top: 10px; left: 12px; right: 12px; display: flex;
+    justify-content: space-between; align-items: center; font-size: 14px; pointer-events: none; }
+  #fs { pointer-events: auto; background: #2a2e35; color: #cfd3d8; border: 0;
+    border-radius: 8px; padding: 8px 14px; font-size: 14px; }
+  #hint { position: fixed; bottom: 14px; width: 100%; text-align: center; font-size: 13px;
+    opacity: .5; pointer-events: none; }
+  .edge { position: fixed; top: 25%; bottom: 25%; width: 4px; border-radius: 2px;
+    background: rgba(120,170,255,.35); pointer-events: none; }
+  #eL { left: 3px; } #eR { right: 3px; }
+
+  /* ---- モニター移動メニュー（画面をモニター数で等分） ---- */
+  #menu { position: fixed; inset: 0; z-index: 10; background: rgba(10,12,16,.93);
+    opacity: 0; pointer-events: none; transition: opacity .12s;
+    touch-action: none; user-select: none; -webkit-user-select: none; }
+  #menu.open { opacity: 1; pointer-events: auto; }
+  #zones { position: absolute; inset: 0; display: flex; }
+  .zone { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 8px; border-left: 1px solid #2f343c; color: #cfd3d8; }
+  .zone:first-child { border-left: 0; }
+  .zone b { font-size: clamp(48px, 14vw, 120px); line-height: 1; }
+  .zone span { font-size: 14px; opacity: .7; }
+  .zone.cur { background: #1f3a5a; color: #fff; }
+  #menuHint { position: absolute; top: 14px; left: 0; right: 0; text-align: center;
+    font-size: 13px; opacity: .6; pointer-events: none; }
+  #closeBtn { position: absolute; top: 8px; right: 12px; background: #2a2e35; color: #cfd3d8;
+    border-radius: 8px; padding: 8px 14px; font-size: 14px; }
+</style>
+</head>
+<body>
+<div id="pad"></div>
+<div class="edge" id="eL"></div><div class="edge" id="eR"></div>
+<div id="hud"><span id="status">接続中…</span><button id="fs">全画面</button></div>
+<div id="menu">
+  <div id="zones"></div>  <div id="closeBtn">閉じる</div>
+</div>
+
+<script>
+// ---- 調整用の設定 ----
+const SENS = 1.6;        // 基本の感度（ゆっくり動かしたとき）
+const ACCEL_START = 0.3; // この速さ(px/ms)を超えると加速が始まる
+const ACCEL = 1.2;       // 加速の強さ（大きいほど高速時に大きく動く）
+const ACCEL_MAX = 6;     // 加速倍率の上限
+const SCROLL = 4;        // スクロール量（大きいほど速い）
+const NATURAL = true;    // true: ナチュラルスクロール（指と同じ向きに動く）
+const TAP_MS = 220;      // タップと判定する最大時間
+const TAP_MOVE = 10;     // タップ/長押しと判定する最大移動量(px)
+const HOLD_MS = 1000;     // 長押しでドラッグ開始するまでの時間
+const TAP_DRAG = true;   // true: タップ直後に触れ直して動かすとドラッグ（その代わり1回タップのクリックが少し遅れる）
+const DTAP_MS = 200;     // タップ後、この時間(ms)内に触れ直すとドラッグ/ダブルクリック扱い
+const TD_START = 4;      // 触れ直してからこの距離(px)動いたらドラッグ開始
+const EDGE_W = 72;       // 左右端からこの幅(px)以内で触れ始めたら「端スワイプ」候補
+const EDGE_DECIDE = 14;  // この距離(px)動いたら端スワイプか通常操作かを判定
+const MENU_SWIPE = 50;   // メニュー内でスワイプと判定する横移動量(px)
+const MENU_IDLE_MS = 3000; // メニューを触らずにこの時間が過ぎたら自動で閉じる
+
+const KEY = new URLSearchParams(location.search).get('key') || '';
+const pad = document.getElementById('pad');
+const statusEl = document.getElementById('status');
+
+// ---- WebSocket ----
+let ws;
+function connect() {
+  ws = new WebSocket(`ws://${location.host}/ws?key=${encodeURIComponent(KEY)}`);
+  ws.onopen = () => { statusEl.textContent = '接続OK'; send({ t: 'monitors' }); };
+  ws.onclose = () => { statusEl.textContent = '切断… 再接続中'; setTimeout(connect, 1000); };
+  ws.onmessage = e => {
+    try {
+      const m = JSON.parse(e.data);
+      if (m.t === 'ping') statusEl.textContent = `接続OK${Math.round(performance.now() - m.ts)}ms`;
+      else if (m.t === 'monitors') { mons = m.list; curIdx = m.cur; renderZones(); }
+    } catch (_) {}
+  };
+}
+function send(o) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(o)); }
+connect();
+setInterval(() => send({ t: 'ping', ts: performance.now() }), 1000); // 往復遅延の表示用
+
+// ---- モニター移動メニュー ----
+const menuEl = document.getElementById('menu');
+const zonesEl = document.getElementById('zones');
+let mons = [], curIdx = 0, menuTimer = 0;
+
+function buzz(n) {                       // 振動で「何番目に移動したか」を知らせる（最大5回）
+  if (!navigator.vibrate) return;
+  const p = [];
+  for (let i = 0; i < Math.min(n, 5); i++) { if (i) p.push(70); p.push(35); }
+  navigator.vibrate(p);
+}
+
+function neighbor(dir) {                 // 今のモニターから見て指定方向でいちばん近いモニター（なければ-1）
+  if (!mons.length) return -1;
+  const c = m => ({ x: (m.l + m.r) / 2, y: (m.t + m.b) / 2 });
+  const me = c(mons[curIdx]);
+  let best = -1, bestScore = Infinity;
+  mons.forEach((m, i) => {
+    if (i === curIdx) return;
+    const p = c(m);
+    const dx = dir === 'left' ? me.x - p.x : p.x - me.x;
+    if (dx <= 0) return;
+    const score = dx + Math.abs(p.y - me.y) * 2;
+    if (score < bestScore) { bestScore = score; best = i; }
+  });
+  return best;
+}
+
+function renderZones() {                 // 画面をモニター数で等分して番号を表示
+  zonesEl.innerHTML = '';
+  if (!mons.length) { zonesEl.textContent = '取得中…'; return; }
+  mons.forEach((m, i) => {
+    const d = document.createElement('div');
+    d.className = 'zone' + (i === curIdx ? ' cur' : '');
+    const label = i === curIdx ? 'いまここ' : `${m.r - m.l}×${m.b - m.t}`;
+    d.innerHTML = `<b>${i + 1}</b><span>${label}</span>`;
+    zonesEl.appendChild(d);
+  });
+}
+
+function resetIdle() { clearTimeout(menuTimer); menuTimer = setTimeout(closeMenu, MENU_IDLE_MS); }
+function openMenu() {
+  menuEl.classList.add('open');
+  send({ t: 'monitors' });               // 最新のモニター配置を取得
+  renderZones();
+  resetIdle();
+  if (navigator.vibrate) navigator.vibrate(15);
+}
+function closeMenu() { clearTimeout(menuTimer); menuEl.classList.remove('open'); }
+
+function teleport(i, keepOpen) {
+  if (i < 0 || i >= mons.length) return;
+  send({ t: 'teleport', i });
+  curIdx = i;
+  buzz(i + 1);
+  if (keepOpen) { renderZones(); resetIdle(); } else closeMenu();
+}
+
+// メニュー内の操作: タップ=その番号のモニターへ / 左右スワイプ=隣のモニターへ
+let mStart = null;
+menuEl.addEventListener('touchstart', e => {
+  const t = e.changedTouches[0];
+  mStart = { x: t.clientX, y: t.clientY, time: e.timeStamp };
+  resetIdle();
+}, { passive: true });
+menuEl.addEventListener('touchend', e => {
+  e.preventDefault();                    // 余計なclickを発生させない
+  if (!mStart) return;
+  const t = e.changedTouches[0];
+  const dx = t.clientX - mStart.x, dy = t.clientY - mStart.y, dur = e.timeStamp - mStart.time;
+  mStart = null;
+  if (e.target.closest && e.target.closest('#closeBtn')) { closeMenu(); return; }
+  if (Math.abs(dx) > MENU_SWIPE && Math.abs(dx) > Math.abs(dy) * 1.5) {
+    const to = neighbor(dx > 0 ? 'right' : 'left');
+    if (to >= 0) teleport(to, true);
+    else if (navigator.vibrate) navigator.vibrate(80);      // これ以上隣がない
+  } else if (Math.hypot(dx, dy) < 14 && dur < 500 && mons.length) {
+    const idx = Math.min(mons.length - 1, Math.floor(t.clientX / (innerWidth / mons.length)));
+    teleport(idx, false);
+  }
+}, { passive: false });
+menuEl.addEventListener('touchcancel', () => { mStart = null; });
+
+// Android標準の「戻るジェスチャー」（画面の最も端からのスワイプ）もメニュー表示に使う
+let trapped = false;
+function trap() { if (!trapped) { history.pushState({ trap: 1 }, ''); trapped = true; } }
+window.addEventListener('popstate', () => { trapped = false; openMenu(); });
+
+// ---- タッチ処理 ----
+const touches = new Map();
+let startTime = 0, maxFingers = 0, moved = false, dragging = false;
+let remX = 0, remY = 0, remScroll = 0, holdTimer = 0, lastT = 0;
+let edgeSide = null, edgeDone = false, edgeOpened = false;
+let pendingClick = 0, tapDragPending = false, tapDragStarted = false;
+
+function cancelHold() { clearTimeout(holdTimer); holdTimer = 0; }
+
+pad.addEventListener('touchstart', e => {
+  e.preventDefault();
+  if (touches.size === 0) {
+    startTime = performance.now(); maxFingers = 0; moved = false; lastT = e.timeStamp;
+    remX = remY = remScroll = 0;
+    edgeDone = false; edgeOpened = false;
+    const x = e.changedTouches[0].clientX;
+    edgeSide = e.touches.length === 1
+      ? (x <= EDGE_W ? 'left' : (x >= innerWidth - EDGE_W ? 'right' : null)) : null;
+    tapDragPending = false; tapDragStarted = false;
+    if (pendingClick) {                              // 直前のタップのクリックが保留中
+      clearTimeout(pendingClick); pendingClick = 0;
+      if (edgeSide) send({ t: 'click', b: 'left' }); // 端スワイプ候補なら、保留分のクリックをすぐ送る
+      else tapDragPending = true;                    // 触れ直し → ドラッグ/ダブルクリック候補
+    }
+    // 動かさずに長押し → ドラッグ開始（振動でお知らせ）
+    holdTimer = setTimeout(() => {
+      holdTimer = 0;
+      if (!moved && touches.size === 1) {
+        edgeSide = null;
+        tapDragPending = false;
+        dragging = true;
+        send({ t: 'down', b: 'left' });
+        if (navigator.vibrate) navigator.vibrate(25);
+      }
+    }, HOLD_MS);
+  } else {
+    cancelHold();
+    edgeSide = null;
+  }
+  for (const t of e.changedTouches) {
+    touches.set(t.identifier, { x: t.clientX, y: t.clientY, sx: t.clientX, sy: t.clientY });
+  }
+  maxFingers = Math.max(maxFingers, touches.size);
+  if (touches.size >= 2 && tapDragPending) {         // 2本指操作に切り替わった → 保留していたクリックを確定
+    tapDragPending = false;
+    send({ t: 'click', b: 'left' });
+  }
+}, { passive: false });
+
+pad.addEventListener('touchmove', e => {
+  e.preventDefault();
+  if (edgeOpened) return;
+  let sx = 0, sy = 0;
+  for (const t of e.changedTouches) {
+    const p = touches.get(t.identifier);
+    if (!p) continue;
+    sx += t.clientX - p.x; sy += t.clientY - p.y;
+    p.x = t.clientX; p.y = t.clientY;
+    if (Math.hypot(p.x - p.sx, p.y - p.sy) > TAP_MOVE) moved = true;
+  }
+  if (moved) cancelHold();
+  const dt = Math.max(e.timeStamp - lastT, 4);   // 経過時間(ms)。極端に短い値は無視
+  lastT = e.timeStamp;
+
+  // タップ直後の触れ直し: 少し動いたらボタンを押してドラッグ開始（それまでカーソルは動かさない）
+  if (tapDragPending && !dragging) {
+    const p = touches.values().next().value;
+    const tx = p.x - p.sx, ty = p.y - p.sy;
+    if (Math.hypot(tx, ty) < TD_START) return;
+    tapDragPending = false; tapDragStarted = true; dragging = true;
+    cancelHold();
+    send({ t: 'down', b: 'left' });
+    remX += (tx - sx) * SENS; remY += (ty - sy) * SENS;  // 保留していた分を反映
+  }
+
+  // 端から始まったタッチ: 内側への横スワイプならメニュー、それ以外は通常操作
+  if (edgeSide && !edgeDone && !dragging) {
+    const p = touches.values().next().value;
+    const tx = p.x - p.sx, ty = p.y - p.sy;
+    if (Math.hypot(tx, ty) < EDGE_DECIDE) return;     // 判定中はカーソルを動かさない
+    edgeDone = true;
+    const inward = edgeSide === 'left' ? tx : -tx;
+    if (inward > 0 && Math.abs(tx) > Math.abs(ty) * 1.5) {
+      edgeOpened = true;
+      openMenu();
+      return;
+    }
+    remX += (tx - sx) * SENS; remY += (ty - sy) * SENS;   // 保留していた分を反映
+  }
+
+  const n = touches.size || 1;
+  const dx = sx / n, dy = sy / n;
+
+  // requestAnimationFrameを挟まず、イベントごとにすぐ送信（遅延を減らす）
+  if (touches.size >= 2 && !dragging) {
+    remScroll += (NATURAL ? 1 : -1) * dy * SCROLL;   // 2本指 = スクロール
+    const s = Math.trunc(remScroll);
+    if (s) { remScroll -= s; send({ t: 'scroll', dy: s }); }
+  } else {
+    const v = Math.hypot(dx, dy) / dt;               // 指の速さ(px/ms)
+    const g = SENS * Math.min(1 + Math.max(v - ACCEL_START, 0) * ACCEL, ACCEL_MAX);
+    remX += dx * g; remY += dy * g;                  // 1本指 = カーソル移動
+    const ix = Math.trunc(remX), iy = Math.trunc(remY);
+    if (ix || iy) { remX -= ix; remY -= iy; send({ t: 'move', dx: ix, dy: iy }); }
+  }
+}, { passive: false });
+
+function end(e) {
+  e.preventDefault();
+  cancelHold();
+  for (const t of e.changedTouches) touches.delete(t.identifier);
+  if (touches.size > 0) return;
+  trap();                                            // 戻るジェスチャー検知の準備
+
+  if (edgeOpened) { edgeOpened = false; return; }
+  if (dragging) {
+    send({ t: 'up', b: 'left' });
+    dragging = false;
+    // 触れ直しでほとんど動かさずに離した → ダブルクリックとして2回目を送る
+    if (tapDragStarted && !moved) send({ t: 'click', b: 'left' });
+    tapDragStarted = false;
+    return;
+  }
+  if (tapDragPending) {                              // 触れ直して動かさずに離した → ダブルクリック
+    tapDragPending = false;
+    if (!moved) { send({ t: 'click', b: 'left' }); send({ t: 'click', b: 'left' }); }
+    return;
+  }
+  if (!moved && performance.now() - startTime < TAP_MS) {
+    if (maxFingers === 1) {
+      if (TAP_DRAG) pendingClick = setTimeout(() => { pendingClick = 0; send({ t: 'click', b: 'left' }); }, DTAP_MS);
+      else send({ t: 'click', b: 'left' });
+    } else if (maxFingers === 2) send({ t: 'click', b: 'right' });
+  }
+}
+pad.addEventListener('touchend', end, { passive: false });
+pad.addEventListener('touchcancel', end, { passive: false });
+pad.addEventListener('contextmenu', e => e.preventDefault());
+
+// ---- 全画面 ----
+document.getElementById('fs').addEventListener('click', () => {
+  if (document.fullscreenElement) document.exitFullscreen();
+  else document.documentElement.requestFullscreen().catch(() => {});
+});
+</script>
+</body>
+</html>
