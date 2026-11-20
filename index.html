@@ -54,6 +54,7 @@ const SCROLL = 4;        // スクロール量（大きいほど速い）
 const NATURAL = true;    // true: ナチュラルスクロール（指と同じ向きに動く）
 const TAP_MS = 220;      // タップと判定する最大時間
 const TAP_MOVE = 10;     // タップ/長押しと判定する最大移動量(px)
+const TAP_MOVE_SQ = TAP_MOVE * TAP_MOVE;
 const HOLD_MS = 1000;     // 長押しでドラッグ開始するまでの時間
 const TAP_DRAG = true;   // true: タップ直後に触れ直して動かすとドラッグ（その代わり1回タップのクリックが少し遅れる）
 const DTAP_MS = 200;     // タップ後、この時間(ms)内に触れ直すとドラッグ/ダブルクリック扱い
@@ -231,7 +232,10 @@ pad.addEventListener('touchmove', e => {
     if (!p) continue;
     sx += t.clientX - p.x; sy += t.clientY - p.y;
     p.x = t.clientX; p.y = t.clientY;
-    if (Math.hypot(p.x - p.sx, p.y - p.sy) > TAP_MOVE) moved = true;
+    if (!moved) {
+      const tx = p.x - p.sx, ty = p.y - p.sy;
+      if (tx * tx + ty * ty > TAP_MOVE_SQ) moved = true;
+    }
   }
   if (moved) cancelHold();
   const dt = Math.max(e.timeStamp - lastT, 4);   // 経過時間(ms)。極端に短い値は無視
